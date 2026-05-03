@@ -1,0 +1,1571 @@
+from datetime import datetime
+from html import escape
+import re
+from typing import List, Optional
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
+from fastapi.responses import Response
+from sqlalchemy.orm import Session as DBSession
+from sqlalchemy.orm.attributes import flag_modified
+from sqlalchemy import or_
+from backend.database import get_db
+from backend import models
+from backend.schemas import VisitCreate, VisitApprove, VisitOut, VisitSummary as VisitSummarySchema
+from backend.auth import require_any_auth, require_admin, audit, RequestContext
+
+router = APIRouter(prefix="/api/visits", tags=["visits"])
+
+
+ALLOWED_TRANSITIONS = {
+    models.VisitStatusEnum.pending: [models.VisitStatusEnum.in_progress, models.VisitStatusEnum.cancelled],
+    models.VisitStatusEnum.in_progress: [models.VisitStatusEnum.completed, models.VisitStatusEnum.cancelled],
+    models.VisitStatusEnum.completed: [],
+    models.VisitStatusEnum.cancelled: [],
+}
+
+
+class UpdateVisitStatusBody(BaseModel):
+    status: str
+
+
+class SaveProgressBody(BaseModel):
+    transcript: Optional[str] = None
+    dialogue: Optional[list] = None
+    status: Optional[str] = None
+
+
+class UpdatePrescriptionDraftBody(BaseModel):
+    prescriptionDraft: dict  # Contains diagnoses, medications, investigations, advice, warnings, reportSummary, followUp
+
+
+class ValidateSummaryBody(BaseModel):
+    summary: Optional[dict] = None
+
+
+SUMMARY_PLACEHOLDER_VALUES = {
+    "",
+    "symptom",
+    "issue",
+    "regular words",
+    "not clearly captured yet",
+    "no summary generated yet",
+}
+
+
+CONDITION_STOP_TERMS = {
+    "have", "having", "pain", "fever", "cough", "cold", "nausea", "vomiting", "headache", "dizziness",
+    "symptom", "issue", "problem", "feels", "feeling", "patient", "reports", "reported", "since", "days",
+}
+
+CONDITION_PHRASE_BLOCKLIST = {
+    "root canal can save",
+    "as long as",
+    "tooth structure",
+    "if the",
+    "plan is",
+    "follow up",
+    "follow-up",
+}
+
+CONDITION_HINT_TERMS = {
+    "pharyngitis", "gastritis", "tonsillitis", "sinusitis", "bronchitis", "pneumonia", "hypertension",
+    "diabetes", "migraine", "asthma", "dermatitis", "arthritis", "infection", "uti", "cystitis",
+    "anemia", "rhinitis", "otitis", "sprain", "strain", "reflux", "gerd", "copd",
+    "caries", "pulpitis", "cellulitis", "decay", "abscess",
+}
+
+SNAPSHOT_SYMPTOM_TERMS = {
+    "headache", "fever", "cough", "cold", "sore throat", "throat pain",
+    "body ache", "back pain", "chest pain", "fatigue", "weakness", "vomiting",
+    "nausea", "diarrhea", "dizziness", "breathlessness", "shortness of breath",
+}
+
+MEDICATION_STOP_TERMS = {
+    "check", "contact", "care", "step", "today", "right", "left", "soft", "toothbrush", "flossing",
+    "xray", "x-ray", "urgent", "warning", "signs", "return", "follow", "avoid",
+}
+
+
+def _normalize_condition_label(label: str) -> str:
+    return re.sub(r"\s+", " ", (label or "").strip())
+
+
+def _clean_condition_label(label: str) -> str:
+    value = _normalize_condition_label(label)
+    if not value:
+        return ""
+    value = re.sub(r"^(most likely|likely|probable)\s+", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"\s+(as long as|if)\b.*$", "", value, flags=re.IGNORECASE)
+    return _normalize_condition_label(value)
+
+
+def _looks_like_condition(label: str) -> bool:
+    value = _normalize_condition_label(label).lower()
+    if not value:
+        return False
+    if any(phrase in value for phrase in CONDITION_PHRASE_BLOCKLIST):
+        return False
+    if len(value.split()) > 8:
+        return False
+
+    tokens = [token for token in re.findall(r"\b[a-zA-Z][a-zA-Z0-9_-]*\b", value) if len(token) > 2]
+    if not tokens:
+        return False
+    if len(tokens) == 1 and tokens[0] in CONDITION_STOP_TERMS:
+        return False
+    if any(token in CONDITION_HINT_TERMS for token in tokens):
+        return True
+    if any(value.endswith(suffix) for suffix in ("itis", "osis", "emia", "pathy", "oma")):
+        return True
+    if len(tokens) >= 2 and len(tokens) <= 8 and all(token not in CONDITION_STOP_TERMS for token in tokens):
+        return True
+    return False
+
+
+def _looks_like_medication_name(name: str) -> bool:
+    value = _normalize_condition_label(name)
+    if not value:
+        return False
+    tokens = [t.lower() for t in re.findall(r"\b[a-zA-Z][a-zA-Z0-9+-]*\b", value)]
+    if not tokens or len(tokens) > 5:
+        return False
+    if any(token in MEDICATION_STOP_TERMS for token in tokens):
+        return False
+    return True
+
+
+def _looks_like_snapshot_condition(label: str) -> bool:
+    value = _normalize_condition_label(label).lower()
+    if not value:
+        return False
+    if value in SUMMARY_PLACEHOLDER_VALUES:
+        return False
+    if len(value.split()) > 8:
+        return False
+    if value in SNAPSHOT_SYMPTOM_TERMS:
+        return True
+    return _looks_like_condition(value)
+
+
+def _extract_medication_from_action_text(text: str) -> dict | None:
+    raw = _normalize_condition_label(text)
+    if not raw:
+        return None
+
+    # Example: "Prescribed Amoxicillin Clavulanate 625 mg 3 times daily after food for 5 days"
+    if not re.search(r"\bprescrib", raw, flags=re.IGNORECASE):
+        return None
+
+    candidate = re.sub(r"^.*?\bprescrib(?:ed|e)?\s+", "", raw, flags=re.IGNORECASE)
+    candidate = re.sub(r"\bfor\b.*$", "", candidate, flags=re.IGNORECASE).strip(" .")
+    if not candidate:
+        return None
+
+    dosage_match = re.search(r"\b\d+(?:\.\d+)?\s*(?:mg|milligram|mcg|g|ml)\b", candidate, flags=re.IGNORECASE)
+    dosage = dosage_match.group(0) if dosage_match else None
+
+    frequency_match = re.search(
+        r"\b(?:once|twice|thrice|\d+\s*times?)\s+(?:daily|a day)|every\s+\d+\s+hours?\b[^.]*",
+        candidate,
+        flags=re.IGNORECASE,
+    )
+    frequency = frequency_match.group(0).strip() if frequency_match else None
+
+    # Strip dosage/frequency to isolate the medication name
+    name = candidate
+    if dosage:
+        name = re.sub(re.escape(dosage), "", name, flags=re.IGNORECASE)
+    if frequency:
+        name = re.sub(re.escape(frequency), "", name, flags=re.IGNORECASE)
+    name = _normalize_condition_label(name).strip(" -,:;")
+
+    if not _looks_like_medication_name(name):
+        return None
+
+    return {
+        "name": name,
+        "dosage": dosage,
+        "frequency": frequency,
+    }
+
+
+def _extract_condition_candidates(summary) -> list[str]:
+    candidates: list[str] = []
+
+    draft = summary.prescriptionDraft
+    if draft and draft.diagnoses:
+        for diagnosis in draft.diagnoses:
+            normalized = _clean_condition_label(diagnosis)
+            if normalized and _looks_like_condition(normalized):
+                candidates.append(normalized)
+
+    # Include explicit assessment statements as condition candidates.
+    sections = summary.sections
+    if sections and sections.assessment:
+        for item in sections.assessment:
+            normalized = _clean_condition_label(str(item))
+            if normalized and _looks_like_condition(normalized):
+                candidates.append(normalized)
+
+    # Fallback: if diagnosis/assessment is sparse, still surface clinically
+    # meaningful snapshot findings (e.g., chief complaint = "headache").
+    if not candidates:
+        chief = _clean_condition_label(str(summary.chiefComplaint or ""))
+        if chief and _looks_like_snapshot_condition(chief):
+            candidates.append(chief)
+
+        for finding in summary.structuredFindings or []:
+            status = str(getattr(finding, "status", "confirmed") or "confirmed").strip().lower()
+            if status == "denied":
+                continue
+            label = _clean_condition_label(str(getattr(finding, "label", "") or ""))
+            if label and _looks_like_snapshot_condition(label):
+                candidates.append(label)
+
+        for fact in summary.clinicalSnapshot or []:
+            status = str(getattr(fact, "status", "confirmed") or "confirmed").strip().lower()
+            if status == "denied":
+                continue
+            category = str(getattr(fact, "category", "") or "").strip().lower()
+            if category not in {"symptom", "assessment"}:
+                continue
+            label = _clean_condition_label(str(getattr(fact, "label", "") or ""))
+            if label and _looks_like_snapshot_condition(label):
+                candidates.append(label)
+
+    deduped: list[str] = []
+    seen = set()
+    for item in candidates:
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
+
+
+def _extract_allergy_candidates(summary) -> list[str]:
+    candidates: list[str] = []
+
+    sections = summary.sections
+    if sections and sections.allergies:
+        for item in sections.allergies:
+            value = _normalize_condition_label(str(item))
+            if value:
+                candidates.append(value)
+
+    source_facts = summary.sourceFacts or []
+    for fact in source_facts:
+        category = str(getattr(fact, "category", "") or "").strip().lower()
+        status = str(getattr(fact, "status", "confirmed") or "confirmed").strip().lower()
+        if category != "allergy" or status == "denied":
+            continue
+        value = _normalize_condition_label(str(getattr(fact, "text", "") or ""))
+        if value:
+            candidates.append(value)
+
+    deduped: list[str] = []
+    seen = set()
+    for item in candidates:
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
+
+
+def _extract_snapshot_notes(summary) -> str | None:
+    notes_parts: list[str] = []
+
+    issues = str(summary.issuesParagraph or "").strip()
+    actions = str(summary.actionsParagraph or "").strip()
+    chief = str(summary.chiefComplaint or "").strip()
+    if chief:
+        notes_parts.append(f"Chief complaint: {chief}")
+    if issues:
+        notes_parts.append(issues)
+    if actions:
+        notes_parts.append(actions)
+
+    draft = summary.prescriptionDraft
+    if draft and draft.reportSummary:
+        report_summary = str(draft.reportSummary).strip()
+        if report_summary:
+            notes_parts.append(f"Report summary: {report_summary}")
+
+    return "\n\n".join(notes_parts) if notes_parts else None
+
+
+def _extract_medication_candidates(summary) -> list[dict]:
+    meds: list[dict] = []
+
+    draft = summary.prescriptionDraft
+    if draft and draft.medications:
+        for med in draft.medications:
+            name = str(med.name or "").strip()
+            if not _looks_like_medication_name(name):
+                continue
+            meds.append({
+                "name": name,
+                "dosage": med.dosage,
+                "frequency": med.frequency,
+            })
+
+    if not meds and summary.prescriptions:
+        for rx in summary.prescriptions:
+            name = str(rx.name or "").strip()
+            if not _looks_like_medication_name(name):
+                continue
+            meds.append({
+                "name": name,
+                "dosage": rx.dosage,
+                "frequency": rx.frequency,
+            })
+
+    # Fallback for summaries where medication details are only captured in
+    # clinical snapshot/action labels (validation already allows this path).
+    if not meds and summary.clinicalSnapshot:
+        for fact in summary.clinicalSnapshot:
+            category = str(getattr(fact, "category", "") or "").strip().lower()
+            status = str(getattr(fact, "status", "confirmed") or "confirmed").strip().lower()
+            if category != "medication" or status == "denied":
+                continue
+
+            label = _normalize_condition_label(str(getattr(fact, "label", "") or ""))
+            if not label:
+                continue
+
+            parsed = _extract_medication_from_action_text(label)
+            if parsed:
+                meds.append(parsed)
+                continue
+
+            if _looks_like_medication_name(label):
+                meds.append({
+                    "name": label,
+                    "dosage": None,
+                    "frequency": None,
+                })
+
+    deduped: list[dict] = []
+    seen = set()
+    for item in meds:
+        key = str(item.get("name") or "").strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
+
+
+def _get_or_create_medical_history(db: DBSession, patient_id: str) -> models.MedicalHistory:
+    med_history = (
+        db.query(models.MedicalHistory)
+        .filter(models.MedicalHistory.patient_id == patient_id)
+        .first()
+    )
+    if med_history:
+        return med_history
+
+    med_history = models.MedicalHistory(patient_id=patient_id, conditions=[], allergies=[], medications=[])
+    db.add(med_history)
+    db.flush()
+    return med_history
+
+
+def _merge_summary_into_medical_history(
+    med_history: models.MedicalHistory,
+    summary_payload: VisitSummarySchema,
+    actor_id: str,
+) -> None:
+    # Only overwrite a field when the new summary produced non-empty data for it.
+    # Replacing with an empty list would silently wipe the patient's existing history
+    # when a visit summary lacks that particular structured section.
+    new_conditions = _extract_condition_candidates(summary_payload)
+    if new_conditions:
+        med_history.conditions = new_conditions
+        flag_modified(med_history, "conditions")
+
+    new_allergies = _extract_allergy_candidates(summary_payload)
+    if new_allergies:
+        med_history.allergies = new_allergies
+        flag_modified(med_history, "allergies")
+
+    new_medications = _extract_medication_candidates(summary_payload)
+    if new_medications:
+        med_history.medications = new_medications
+        flag_modified(med_history, "medications")
+
+    # Notes are always overwritten — they're built from the visit narrative and
+    # should reflect the latest approved visit even if the text is sparse.
+    med_history.notes = _extract_snapshot_notes(summary_payload)
+    med_history.updated_by = actor_id
+
+
+def _complete_linked_appointment(db: DBSession, visit: models.Visit, now: datetime) -> None:
+    if not visit.appointment_id:
+        return
+
+    appt = db.query(models.Appointment).filter(models.Appointment.id == visit.appointment_id).first()
+    if not appt:
+        return
+
+    appt.status = models.AppointmentStatusEnum.completed
+    appt.completed_at = now
+    appt.visit_id = visit.id
+
+
+def _close_queue_entry(db: DBSession, visit: models.Visit, now: datetime) -> None:
+    queue_entry = (
+        db.query(models.WaitingQueue)
+        .filter(
+            models.WaitingQueue.patient_id == visit.patient_id,
+            models.WaitingQueue.status.in_([models.WaitingQueueStatusEnum.in_room, models.WaitingQueueStatusEnum.called]),
+        )
+        .first()
+    )
+    if queue_entry:
+        queue_entry.status = models.WaitingQueueStatusEnum.done
+        queue_entry.done_at = now
+
+
+def _release_room(db: DBSession, visit: models.Visit) -> None:
+    if not visit.room_id:
+        return
+
+    room = db.query(models.Room).filter(models.Room.id == visit.room_id).first()
+    if not room:
+        return
+
+    room.status = models.RoomStatusEnum.idle
+    room.current_patient_id = None
+    room.assigned_doctor_id = None
+    if hasattr(room, "current_doctor_id"):
+        setattr(room, "current_doctor_id", None)
+
+
+def _normalize_quality_payload(summary: dict | None) -> dict | None:
+    data = summary or {}
+    quality = data.get("quality") or data.get("summary_quality")
+    if not isinstance(quality, dict):
+        return None
+
+    score = float(quality.get("score") or 0)
+    confidence = float(quality.get("confidence") or 0)
+    missing_fields = quality.get("missingFields") or quality.get("missing_fields") or []
+    coverage = quality.get("coverage")
+    source_fact_count = quality.get("sourceFactCount") or quality.get("source_fact_count")
+    mapped_fact_count = quality.get("mappedFactCount") or quality.get("mapped_fact_count")
+    unmapped_fact_ids = quality.get("unmappedFactIds") or quality.get("unmapped_fact_ids") or []
+    critical_misses = quality.get("criticalMisses") or quality.get("critical_misses") or []
+    section_counts = quality.get("sectionCounts") or quality.get("section_counts") or {}
+
+    return {
+        "score": max(0.0, min(100.0, score)),
+        "confidence": max(0.0, min(1.0, confidence)),
+        "missingFields": [str(item).strip() for item in missing_fields if str(item).strip()],
+        "mode": str(quality.get("mode") or "hybrid").strip() or "hybrid",
+        "generatedAt": str(quality.get("generatedAt") or quality.get("generated_at") or "").strip() or None,
+        "coverage": max(0.0, min(1.0, float(coverage))) if coverage is not None else None,
+        "sourceFactCount": max(0, int(source_fact_count)) if source_fact_count is not None else None,
+        "mappedFactCount": max(0, int(mapped_fact_count)) if mapped_fact_count is not None else None,
+        "unmappedFactIds": [str(item).strip() for item in unmapped_fact_ids if str(item).strip()],
+        "criticalMisses": [str(item).strip() for item in critical_misses if str(item).strip()],
+        "sectionCounts": {
+            str(key).strip(): max(0, int(value))
+            for key, value in section_counts.items()
+            if str(key).strip()
+        } if isinstance(section_counts, dict) else {},
+    }
+
+
+def _normalize_structured_findings_payload(summary: dict | None) -> list[dict]:
+    data = summary or {}
+    findings = data.get("structuredFindings") or data.get("structured_findings") or []
+    if not isinstance(findings, list):
+        return []
+
+    normalized = []
+    for index, item in enumerate(findings):
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("label") or "").strip()
+        if not label:
+            continue
+        category = str(item.get("category") or "symptom").strip() or "symptom"
+        status = str(item.get("status") or "confirmed").strip() or "confirmed"
+        confidence = float(item.get("confidence") or 0)
+        evidence = str(item.get("evidence") or "").strip() or None
+
+        normalized.append({
+            "id": str(item.get("id") or f"f-{index}"),
+            "label": label,
+            "category": category,
+            "status": status,
+            "confidence": max(0.0, min(1.0, confidence)),
+            "evidence": evidence,
+        })
+
+    return normalized
+
+
+def _empty_sections_payload() -> dict:
+    return {
+        "historyOfPresentIllness": [],
+        "negativeFindings": [],
+        "riskFactors": [],
+        "pastHistory": [],
+        "medicationHistory": [],
+        "allergies": [],
+        "vitals": [],
+        "examination": [],
+        "assessment": [],
+        "medications": [],
+        "investigations": [],
+        "carePlan": [],
+        "warnings": [],
+        "followUp": [],
+        "unmapped": [],
+    }
+
+
+def _normalize_source_facts_payload(summary: dict | None) -> list[dict]:
+    data = summary or {}
+    facts = data.get("sourceFacts") or data.get("source_facts") or []
+    if not isinstance(facts, list):
+        return []
+
+    normalized = []
+    for index, item in enumerate(facts):
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text") or "").strip()
+        if not text:
+            continue
+        normalized.append({
+            "id": str(item.get("id") or f"sf-{index}"),
+            "speaker": str(item.get("speaker") or "Unknown").strip() or "Unknown",
+            "turnIndex": int(item.get("turnIndex") or item.get("turn_index") or 0),
+            "sentenceIndex": int(item.get("sentenceIndex") or item.get("sentence_index") or 0),
+            "category": str(item.get("category") or "other").strip() or "other",
+            "section": str(item.get("section") or "unmapped").strip() or "unmapped",
+            "text": text,
+            "evidence": str(item.get("evidence") or "").strip() or None,
+            "status": str(item.get("status") or "confirmed").strip() or "confirmed",
+            "confidence": max(0.0, min(1.0, float(item.get("confidence") or 0))),
+            "mapped": bool(item.get("mapped", True)),
+            "isSupported": item.get("isSupported"),
+        })
+    return normalized
+
+
+def _normalize_summary_sections_payload(summary: dict | None) -> dict:
+    data = summary or {}
+    raw = data.get("sections") or data.get("summarySections") or data.get("summary_sections") or {}
+    normalized = _empty_sections_payload()
+    if not isinstance(raw, dict):
+        return normalized
+
+    for key in normalized.keys():
+        values = raw.get(key) or raw.get(re.sub(r"([A-Z])", lambda m: "_" + m.group(1).lower(), key))
+        if not isinstance(values, list):
+            continue
+        normalized[key] = [str(item).strip() for item in values if str(item).strip()]
+    return normalized
+
+
+def _normalize_prescription_payload(summary: dict | None) -> dict:
+    data = summary or {}
+    draft = data.get("prescriptionDraft") or data.get("prescription_draft") or {}
+
+    diagnoses = [str(item).strip() for item in draft.get("diagnoses", []) if str(item).strip()]
+    medications = [
+        item for item in draft.get("medications", [])
+        if isinstance(item, dict) and str(item.get("name", "")).strip()
+    ]
+    investigations = [
+        item for item in draft.get("investigations", [])
+        if isinstance(item, dict) and str(item.get("name", "")).strip()
+    ]
+    advice = [str(item).strip() for item in draft.get("advice", []) if str(item).strip()]
+    warnings = [str(item).strip() for item in draft.get("warnings", []) if str(item).strip()]
+    report_summary = str(draft.get("reportSummary") or draft.get("report_summary") or "").strip()
+    follow_up = draft.get("followUp") or draft.get("follow_up")
+
+    if not medications:
+        for item in data.get("prescriptions", []) or data.get("prescription_list", []) or []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "")).strip()
+            if not name:
+                continue
+            medications.append({
+                "name": name,
+                "dosage": str(item.get("dosage") or "").strip() or None,
+                "frequency": str(item.get("frequency") or "").strip() or None,
+                "duration": None,
+                "route": None,
+                "instructions": None,
+            })
+
+    if not diagnoses:
+        diagnoses = []
+    if not advice:
+        advice = [
+            str(item.get("text", "")).strip()
+            for item in data.get("doctorActions", []) or data.get("doctor_actions", []) or []
+            if isinstance(item, dict) and str(item.get("text", "")).strip()
+        ][:5]
+
+    return {
+        "diagnoses": diagnoses,
+        "medications": medications,
+        "investigations": investigations,
+        "advice": advice,
+        "warnings": warnings,
+        "report_summary": report_summary,
+        "follow_up": follow_up if isinstance(follow_up, dict) else None,
+    }
+
+
+def _is_placeholder_value(value: str) -> bool:
+    normalized = re.sub(r"\s+", " ", (value or "").strip().lower())
+    return normalized in SUMMARY_PLACEHOLDER_VALUES
+
+
+def _normalize_doctor_actions_payload(summary: dict | None) -> list[dict]:
+    data = summary or {}
+    raw_actions = data.get("doctorActions") or data.get("doctor_actions") or []
+    if not isinstance(raw_actions, list):
+        return []
+
+    normalized: list[dict] = []
+    seen: set[str] = set()
+
+    for index, item in enumerate(raw_actions):
+        text = ""
+        source_fact_ids: list[str] = []
+        is_edited = False
+
+        if isinstance(item, dict):
+            text = str(
+                item.get("text")
+                or item.get("action")
+                or item.get("label")
+                or item.get("note")
+                or ""
+            ).strip()
+            raw_fact_ids = item.get("sourceFactIds") or item.get("source_fact_ids") or []
+            if isinstance(raw_fact_ids, list):
+                source_fact_ids = [str(value).strip() for value in raw_fact_ids if str(value).strip()]
+            is_edited = bool(item.get("isEdited") or item.get("is_edited") or False)
+        else:
+            text = str(item).strip()
+
+        if not text:
+            continue
+
+        lowered = text.lower()
+        if lowered.startswith("{") and lowered.endswith("}") and "action" in lowered:
+            action_match = re.search(r"['\"]action['\"]\s*:\s*['\"](.+?)['\"]\s*\}?$", text)
+            if action_match:
+                text = action_match.group(1).strip()
+
+        text = re.sub(r"\s+", " ", text).strip(" ,")
+        if not text:
+            continue
+
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+
+        normalized.append({
+            "id": f"action-{index}",
+            "text": text[:1000],
+            "sourceFactIds": source_fact_ids,
+            "isEdited": is_edited,
+        })
+
+    return normalized
+
+
+def _validate_summary_for_approval(summary: dict) -> dict:
+    warnings: list[str] = []
+
+    issues_paragraph = str(summary.get("issuesParagraph") or "").strip()
+    if not issues_paragraph:
+        warnings.append("Clinical summary paragraph is empty.")
+
+    actions_paragraph = str(summary.get("actionsParagraph") or "").strip()
+    if not actions_paragraph:
+        warnings.append("Actions paragraph is empty.")
+
+    clinical_snapshot = summary.get("clinicalSnapshot") or []
+    if not isinstance(clinical_snapshot, list) or len(clinical_snapshot) == 0:
+        warnings.append("Clinical snapshot is empty.")
+
+    quality = _normalize_quality_payload(summary)
+    if quality:
+        coverage = quality.get("coverage")
+        if coverage is not None and coverage < 0.75:
+            warnings.append(f"Structured fact coverage is low ({round(coverage * 100)}%). Review summary completeness before approval.")
+        critical_misses = quality.get("criticalMisses") or []
+        if critical_misses:
+            warnings.append(f"Critical sections may be incomplete: {', '.join(critical_misses)}.")
+
+    return {
+        "ok": True,
+        "missingFields": [],
+        "warnings": warnings,
+    }
+
+
+def _sanitize_summary_for_response(summary: dict | None) -> dict:
+    data = summary if isinstance(summary, dict) else {}
+    normalized = _normalize_prescription_payload(data)
+    normalized_source_facts = _normalize_source_facts_payload(data)
+    normalized_sections = _normalize_summary_sections_payload(data)
+    normalized_quality = _normalize_quality_payload(data)
+
+    return {
+        "clinicalSnapshot": data.get("clinicalSnapshot") or data.get("clinical_snapshot") or [],
+        "doctorActions": _normalize_doctor_actions_payload(data),
+        "prescriptions": data.get("prescriptions") or data.get("prescription_list") or [],
+        "prescriptionDraft": {
+            "diagnoses": normalized["diagnoses"],
+            "medications": normalized["medications"],
+            "investigations": normalized["investigations"],
+            "advice": normalized["advice"],
+            "warnings": normalized["warnings"],
+            "reportSummary": normalized["report_summary"],
+            "followUp": normalized["follow_up"],
+        } if (
+            normalized["diagnoses"]
+            or normalized["medications"]
+            or normalized["investigations"]
+            or normalized["advice"]
+            or normalized["warnings"]
+            or normalized["report_summary"]
+            or normalized["follow_up"]
+        ) else None,
+        "issuesParagraph": str(data.get("issuesParagraph") or data.get("issues_paragraph") or ""),
+        "actionsParagraph": str(data.get("actionsParagraph") or data.get("actions_paragraph") or ""),
+        "chiefComplaint": str(data.get("chiefComplaint") or data.get("chief_complaint") or ""),
+        "structuredFindings": data.get("structuredFindings") or data.get("structured_findings") or [],
+        "sourceFacts": normalized_source_facts,
+        "sections": normalized_sections,
+        "quality": normalized_quality,
+    }
+
+
+def _format_medication_line(item: dict) -> str:
+    parts = [
+        str(item.get("dosage") or "").strip(),
+        str(item.get("frequency") or "").strip(),
+        str(item.get("duration") or "").strip(),
+        str(item.get("route") or "").strip(),
+        str(item.get("instructions") or "").strip(),
+    ]
+    details = " • ".join(part for part in parts if part)
+    return f"{escape(str(item.get('name', '')).strip())}{f' — {escape(details)}' if details else ''}"
+
+
+def _render_list(items: list[str]) -> str:
+    return "".join(f"<li>{escape(item)}</li>" for item in items if item)
+
+
+def _build_prescription_html(visit: models.Visit) -> str:
+    patient = visit.patient
+    doctor = visit.doctor
+    history = getattr(patient, "medical_history", None) if patient else None
+    summary = visit.summary if isinstance(visit.summary, dict) else {}
+    prescription = _normalize_prescription_payload(summary)
+
+    patient_name = escape(getattr(patient, "name", "Patient") or "Patient")
+    patient_mrn  = escape(getattr(patient, "mrn", "") or "N/A")
+    raw_dob = getattr(patient, "date_of_birth", "") or ""
+    patient_dob  = escape(str(raw_dob).split("T")[0] if raw_dob else "N/A")
+    patient_sex  = escape(getattr(patient, "sex", "") or getattr(patient, "gender", "") or "N/A")
+    doctor_name  = escape(getattr(doctor, "name", "") or "Attending Physician")
+    doctor_specialty = escape(getattr(doctor, "specialty", "") or "General Medicine")
+    allergies    = [str(a).strip() for a in (getattr(history, "allergies", None) or []) if str(a).strip()]
+    visit_date   = (visit.created_at or datetime.utcnow()).strftime("%B %d, %Y")
+    ref_no       = f"RX-{visit.id[:8].upper()}"
+
+    medication_items  = prescription["medications"]
+    if not medication_items:
+        for item in summary.get("prescriptions", []) or []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "")).strip()
+            if not name:
+                continue
+            medication_items.append({
+                "name": name,
+                "dosage": str(item.get("dosage") or "").strip() or None,
+                "frequency": str(item.get("frequency") or "").strip() or None,
+                "duration": None,
+                "route": None,
+                "instructions": None,
+            })
+    diagnoses         = prescription["diagnoses"]
+    advice            = prescription["advice"]
+    warnings          = prescription["warnings"]
+    investigations    = prescription["investigations"]
+    report_summary    = prescription["report_summary"]
+    follow_up         = prescription["follow_up"] or {}
+    follow_up_timeline = str(follow_up.get("timeline") or "").strip()
+    follow_up_notes    = str(follow_up.get("notes") or "").strip()
+
+    def med_rows(items):
+        rows = []
+        for item in items:
+            name  = escape(str(item.get("name", "")).strip())
+            dose  = escape(str(item.get("dosage") or "").strip())
+            freq  = escape(str(item.get("frequency") or "").strip())
+            dur   = escape(str(item.get("duration") or "").strip())
+            route = escape(str(item.get("route") or "").strip())
+            instr = escape(str(item.get("instructions") or "").strip())
+            rows.append(
+                f"<tr>"
+                f"<td class=\"med-name\">{name}</td>"
+                f"<td>{dose or '—'}</td>"
+                f"<td>{freq or '—'}</td>"
+                f"<td>{dur or '—'}</td>"
+                f"<td>{route or '—'}</td>"
+                f"<td class=\"instr\">{instr or '—'}</td>"
+                f"</tr>"
+            )
+        return "".join(rows)
+
+    def list_items(items):
+        return "".join(f"<li>{escape(str(i))}</li>" for i in items if str(i).strip())
+
+    allergies_str = escape(", ".join(allergies)) if allergies else "None on file"
+
+    med_section = f"""
+      <table class="med-table">
+        <thead>
+          <tr>
+            <th>Medicine</th><th>Dose</th><th>Frequency</th>
+            <th>Duration</th><th>Route</th><th>Instructions</th>
+          </tr>
+        </thead>
+        <tbody>{med_rows(medication_items)}</tbody>
+      </table>""" if medication_items else "<p class=\"empty\">No medications documented for this visit.</p>"
+
+    inv_section = ""
+    if investigations:
+        inv_items = "".join(
+            f"<li><strong>{escape(str(item.get('name','')))}:</strong> "
+            f"{escape(str(item.get('details','') or item.get('timing','') or '—'))}</li>"
+            for item in investigations
+        )
+        inv_section = f"<ul>{inv_items}</ul>"
+    elif report_summary:
+        inv_section = f"<p>{escape(report_summary)}</p>"
+    else:
+        inv_section = "<p class=\"empty\">No investigations ordered.</p>"
+
+    adv_section = f"<ul>{list_items(advice)}</ul>" if advice else "<p class=\"empty\">No specific advice documented.</p>"
+    warn_section = f"<ul>{list_items(warnings)}</ul>" if warnings else "<p class=\"empty\">No specific warnings documented.</p>"
+
+    diag_section = f"<ul>{list_items(diagnoses)}</ul>" if diagnoses else "<p class=\"empty\">No structured assessment captured.</p>"
+
+    follow_up_html = ""
+    if follow_up_timeline or follow_up_notes:
+        parts = [p for p in [follow_up_timeline, follow_up_notes] if p]
+        follow_up_html = f"<p class=\"followup-note\"><strong>Follow-up:</strong> {escape(' — '.join(parts))}</p>"
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>Prescription — {patient_name}</title>
+  <style>
+    *, *::before, *::after {{ box-sizing: border-box; }}
+    body {{
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+      margin: 0; padding: 32px;
+      background: #f1f5f9;
+      color: #0f172a;
+      font-size: 14px;
+      line-height: 1.5;
+    }}
+    .page {{
+      max-width: 860px;
+      margin: 0 auto;
+      background: #fff;
+      border-radius: 12px;
+      box-shadow: 0 4px 24px rgba(0,0,0,0.08);
+      overflow: hidden;
+    }}
+    /* ── Header ── */
+    .header {{
+      background: #0f172a;
+      color: #fff;
+      padding: 28px 36px;
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 24px;
+    }}
+    .header-left h1 {{
+      margin: 0 0 4px;
+      font-size: 22px;
+      font-weight: 700;
+      letter-spacing: -0.3px;
+    }}
+    .header-left p {{ margin: 0; font-size: 13px; color: #94a3b8; }}
+    .header-right {{ text-align: right; flex-shrink: 0; }}
+    .header-right .clinic {{ font-size: 11px; color: #64748b; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 6px; }}
+    .header-right .doctor-name {{ font-size: 17px; font-weight: 700; color: #fff; margin: 0 0 2px; }}
+    .header-right .specialty {{ font-size: 13px; color: #94a3b8; margin: 0; }}
+    .ref-badge {{
+      display: inline-block;
+      margin-top: 8px;
+      padding: 3px 10px;
+      background: rgba(255,255,255,0.1);
+      border: 1px solid rgba(255,255,255,0.2);
+      border-radius: 6px;
+      font-size: 11px;
+      color: #cbd5e1;
+      font-family: monospace;
+      word-break: break-all;
+      max-width: 200px;
+    }}
+    /* ── Patient Info Bar ── */
+    .patient-bar {{
+      background: #f8fafc;
+      border-bottom: 1px solid #e2e8f0;
+      padding: 16px 36px;
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 16px;
+    }}
+    .patient-bar .info-item label {{
+      display: block;
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+      color: #94a3b8;
+      margin-bottom: 3px;
+    }}
+    .patient-bar .info-item span {{
+      font-size: 14px;
+      font-weight: 600;
+      color: #0f172a;
+    }}
+    .allergy-flag {{
+      background: #fef2f2;
+      border: 1px solid #fecaca;
+      border-radius: 6px;
+      padding: 3px 8px;
+      font-size: 12px;
+      font-weight: 600;
+      color: #dc2626;
+    }}
+    /* ── Body ── */
+    .body {{ padding: 28px 36px; }}
+    .section {{ margin-bottom: 28px; }}
+    .section:last-child {{ margin-bottom: 0; }}
+    .section-title {{
+      font-size: 11px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: #64748b;
+      margin: 0 0 12px;
+      padding-bottom: 8px;
+      border-bottom: 2px solid #f1f5f9;
+    }}
+    ul {{ margin: 0; padding-left: 18px; }}
+    li {{ margin-bottom: 5px; color: #1e293b; }}
+    p {{ margin: 0; color: #1e293b; }}
+    .empty {{ color: #94a3b8; font-style: italic; }}
+    /* ── Medication Table ── */
+    .med-table {{
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }}
+    .med-table th {{
+      background: #f8fafc;
+      border: 1px solid #e2e8f0;
+      padding: 8px 10px;
+      text-align: left;
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: #64748b;
+    }}
+    .med-table td {{
+      border: 1px solid #e2e8f0;
+      padding: 10px;
+      vertical-align: top;
+      color: #1e293b;
+    }}
+    .med-table tr:nth-child(even) td {{ background: #f8fafc; }}
+    .med-table td.med-name {{ font-weight: 600; color: #0f172a; }}
+    .med-table td.instr {{ font-size: 12px; color: #475569; }}
+    /* ── Follow-up ── */
+    .followup-note {{
+      background: #f0fdf4;
+      border: 1px solid #bbf7d0;
+      border-radius: 8px;
+      padding: 10px 14px;
+      color: #166534;
+      margin-top: 8px;
+    }}
+    /* ── Signature ── */
+    .signature-bar {{
+      margin-top: 40px;
+      padding-top: 20px;
+      border-top: 1px dashed #e2e8f0;
+      display: flex;
+      justify-content: flex-end;
+    }}
+    .sig-block {{ text-align: center; }}
+    .sig-line {{ width: 180px; border-top: 1px solid #0f172a; margin-bottom: 6px; }}
+    .sig-label {{ font-size: 12px; color: #475569; }}
+    .sig-name {{ font-size: 14px; font-weight: 700; color: #0f172a; }}
+    /* ── Footer ── */
+    .footer {{
+      background: #f8fafc;
+      border-top: 1px solid #e2e8f0;
+      padding: 12px 36px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }}
+    .footer p {{ font-size: 11px; color: #94a3b8; margin: 0; }}
+    @media print {{
+      body {{ background: #fff; padding: 0; }}
+      .page {{ box-shadow: none; border-radius: 0; }}
+    }}
+  </style>
+</head>
+<body>
+  <div class="page">
+
+    <div class="header">
+      <div class="header-left">
+        <h1>Clinical Prescription</h1>
+        <p>Generated on {escape(visit_date)}</p>
+      </div>
+      <div class="header-right">
+        <p class="clinic">Alvyto Health</p>
+        <p class="doctor-name">{doctor_name}</p>
+        <p class="specialty">{doctor_specialty}</p>
+        <span class="ref-badge">{escape(ref_no)}</span>
+      </div>
+    </div>
+
+    <div class="patient-bar">
+      <div class="info-item">
+        <label>Patient</label>
+        <span>{patient_name}</span>
+      </div>
+      <div class="info-item">
+        <label>MRN</label>
+        <span>{patient_mrn}</span>
+      </div>
+      <div class="info-item">
+        <label>Date of Birth</label>
+        <span>{patient_dob}</span>
+      </div>
+      <div class="info-item">
+        <label>Sex / Allergies</label>
+        <span>{'<span class="allergy-flag">⚠ ' + allergies_str + '</span>' if allergies else patient_sex + ' / None'}</span>
+      </div>
+    </div>
+
+    <div class="body">
+
+      <div class="section">
+        <p class="section-title">Assessment / Diagnosis</p>
+        {diag_section}
+      </div>
+
+      <div class="section">
+        <p class="section-title">Medications Prescribed</p>
+        {med_section}
+      </div>
+
+      <div class="section">
+        <p class="section-title">Investigations & Reports</p>
+        {inv_section}
+      </div>
+
+      <div class="section">
+        <p class="section-title">Advice & Instructions</p>
+        {adv_section}
+      </div>
+
+      <div class="section">
+        <p class="section-title">Warnings & Precautions</p>
+        {warn_section}
+        {follow_up_html}
+      </div>
+
+      <div class="signature-bar">
+        <div class="sig-block">
+          <div class="sig-line"></div>
+          <p class="sig-name">{doctor_name}</p>
+          <p class="sig-label">{doctor_specialty}</p>
+        </div>
+      </div>
+
+    </div>
+
+    <div class="footer">
+      <p>This prescription was generated by Alvyto Health — {escape(visit_date)}</p>
+      <p>Ref: {escape(ref_no)}</p>
+    </div>
+
+  </div>
+</body>
+</html>"""
+
+@router.get("", response_model=List[VisitOut])
+@router.get("/", response_model=List[VisitOut])
+def list_visits(
+    status: Optional[str] = Query(None),
+    doctor_id: Optional[str] = Query(None),
+    patient_id: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    ctx: RequestContext = Depends(require_admin),
+    db: DBSession = Depends(get_db),
+):
+    """List visits with optional filters — admin only. Excludes soft-deleted visits."""
+    q = db.query(models.Visit).filter(models.Visit.is_deleted == False)
+    if status:
+        try:
+            status_enum = models.VisitStatusEnum(status)
+        except ValueError as exc:
+            raise HTTPException(400, "Invalid visit status") from exc
+        q = q.filter(models.Visit.status == status_enum)
+    if doctor_id:
+        q = q.filter(models.Visit.doctor_id == doctor_id)
+    if patient_id:
+        q = q.filter(models.Visit.patient_id == patient_id)
+    q = q.order_by(models.Visit.created_at.desc())
+    visits = q.offset(offset).limit(limit).all()
+    for visit in visits:
+        visit.summary = _sanitize_summary_for_response(visit.summary)
+    return visits
+
+
+@router.post("", response_model=VisitOut, status_code=201)
+@router.post("/", response_model=VisitOut, status_code=201)
+def create_visit(
+    body: VisitCreate,
+    ctx: RequestContext = Depends(require_any_auth),
+    db: DBSession = Depends(get_db),
+):
+    # Room devices can only create visits for their assigned room
+    if ctx.is_room_device and body.room_id and body.room_id != ctx.room_id:
+        raise HTTPException(403, "Room device can only create visits for its own room")
+
+    patient = db.query(models.Patient).filter(models.Patient.id == body.patient_id).first()
+    if not patient:
+        raise HTTPException(404, "Patient not found")
+
+    if body.doctor_id:
+        doctor = db.query(models.Doctor).filter(models.Doctor.id == body.doctor_id, models.Doctor.is_active == True).first()
+        if not doctor:
+            raise HTTPException(404, "Doctor not found")
+
+    if body.room_id:
+        room = db.query(models.Room).filter(models.Room.id == body.room_id).first()
+        if not room:
+            raise HTTPException(404, "Room not found")
+
+    if body.appointment_id:
+        appt = db.query(models.Appointment).filter(models.Appointment.id == body.appointment_id).first()
+        if not appt:
+            raise HTTPException(404, "Appointment not found")
+        if appt.patient_id != body.patient_id:
+            raise HTTPException(400, "Appointment does not belong to patient")
+        if body.doctor_id and appt.doctor_id and appt.doctor_id != body.doctor_id:
+            raise HTTPException(400, "Appointment doctor mismatch")
+
+    active_visit_matchers = [models.Visit.patient_id == body.patient_id]
+    if body.room_id:
+        active_visit_matchers.append(models.Visit.room_id == body.room_id)
+    if body.appointment_id:
+        active_visit_matchers.append(models.Visit.appointment_id == body.appointment_id)
+
+    existing_visit = (
+        db.query(models.Visit)
+        .filter(
+            models.Visit.is_deleted == False,
+            models.Visit.status.in_([models.VisitStatusEnum.pending, models.VisitStatusEnum.in_progress]),
+            or_(*active_visit_matchers),
+        )
+        .order_by(models.Visit.created_at.desc())
+        .first()
+    )
+    if existing_visit:
+        raise HTTPException(
+            409,
+            {
+                "message": "An active visit already exists",
+                "existingVisitId": existing_visit.id,
+                "status": existing_visit.status.value,
+            },
+        )
+
+    visit = models.Visit(**body.model_dump())
+    visit.status = models.VisitStatusEnum.pending
+    if ctx.is_room_device:
+        visit.room_id = ctx.room_id
+    db.add(visit)
+
+    # Mark appointment in_progress if linked
+    if body.appointment_id:
+        appt = db.query(models.Appointment).filter(models.Appointment.id == body.appointment_id).first()
+        if appt:
+            appt.status = models.AppointmentStatusEnum.in_progress
+            appt.started_at = datetime.utcnow()
+
+    # Mark room in_use
+    if visit.room_id:
+        room = db.query(models.Room).filter(models.Room.id == visit.room_id).first()
+        if room:
+            room.status = models.RoomStatusEnum.in_use
+            room.current_patient_id = visit.patient_id
+
+    db.commit()
+    db.refresh(visit)
+    audit(db, ctx, "CREATE_VISIT", "visit", visit.id, {"patient_id": visit.patient_id})
+    return visit
+
+
+@router.get("/{visit_id}", response_model=VisitOut)
+def get_visit(
+    visit_id: str,
+    ctx: RequestContext = Depends(require_any_auth),
+    db: DBSession = Depends(get_db),
+):
+    visit = db.query(models.Visit).filter(models.Visit.id == visit_id, models.Visit.is_deleted == False).first()
+    if not visit:
+        raise HTTPException(404, "Visit not found")
+    if ctx.is_room_device and visit.room_id != ctx.room_id:
+        raise HTTPException(403, "Access denied")
+    visit.summary = _sanitize_summary_for_response(visit.summary)
+    audit(db, ctx, "VIEW_VISIT", "visit", visit_id)
+    return visit
+
+
+@router.get("/{visit_id}/prescription")
+def download_visit_prescription(
+    visit_id: str,
+    ctx: RequestContext = Depends(require_any_auth),
+    db: DBSession = Depends(get_db),
+):
+    visit = db.query(models.Visit).filter(models.Visit.id == visit_id, models.Visit.is_deleted == False).first()
+    if not visit:
+        raise HTTPException(404, "Visit not found")
+    if ctx.is_room_device and visit.room_id != ctx.room_id:
+        raise HTTPException(403, "Access denied")
+    if visit.status not in {models.VisitStatusEnum.completed}:
+        raise HTTPException(409, "Prescription export is only available for completed visits")
+
+    html = _build_prescription_html(visit)
+    patient_name = (getattr(visit.patient, "name", None) or "patient").strip().lower().replace(" ", "-")
+    filename = f"prescription-{patient_name or 'patient'}-{visit_id[:8]}.html"
+    audit(db, ctx, "DOWNLOAD_PRESCRIPTION", "visit", visit_id, {"patient_id": visit.patient_id})
+    return Response(
+        content=html,
+        media_type="text/html; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.patch("/{visit_id}/status")
+def update_visit_status(
+    visit_id: str,
+    body: UpdateVisitStatusBody,
+    ctx: RequestContext = Depends(require_any_auth),
+    db: DBSession = Depends(get_db),
+):
+    visit = db.query(models.Visit).filter(models.Visit.id == visit_id, models.Visit.is_deleted == False).first()
+    if not visit:
+        raise HTTPException(404, "Visit not found")
+    if ctx.is_room_device and visit.room_id != ctx.room_id:
+        raise HTTPException(403, "Access denied")
+
+    if body.status is None:
+        raise HTTPException(400, "Missing required field: status")
+
+    try:
+        new_status = models.VisitStatusEnum(body.status)
+    except ValueError as exc:
+        raise HTTPException(400, "Invalid visit status") from exc
+
+    try:
+        current_status = visit.status if isinstance(visit.status, models.VisitStatusEnum) else models.VisitStatusEnum(str(visit.status))
+    except ValueError as exc:
+        raise HTTPException(400, f"Invalid current visit status: {visit.status}") from exc
+
+    if current_status not in ALLOWED_TRANSITIONS:
+        raise HTTPException(400, f"Invalid current visit status: {current_status.value}")
+    if new_status not in ALLOWED_TRANSITIONS[current_status]:
+        raise HTTPException(400, f"Invalid status transition: {current_status.value} -> {new_status.value}")
+    visit.status = new_status
+    db.commit()
+    audit(
+        db,
+        ctx,
+        "UPDATE_VISIT_STATUS",
+        "visit",
+        visit.id,
+        {"from_status": current_status.value, "to_status": new_status.value},
+    )
+    return {"id": visit.id, "status": visit.status.value}
+
+
+@router.patch("/{visit_id}/progress")
+def save_visit_progress(
+    visit_id: str,
+    body: "SaveProgressBody",
+    ctx: RequestContext = Depends(require_any_auth),
+    db: DBSession = Depends(get_db),
+):
+    """Save transcript + dialogue mid-session without changing visit status.
+    Called periodically during recording and when pipeline finishes.
+    Idempotent — safe to call many times."""
+    visit = db.query(models.Visit).filter(models.Visit.id == visit_id, models.Visit.is_deleted == False).first()
+    if not visit:
+        raise HTTPException(404, "Visit not found")
+    if ctx.is_room_device and visit.room_id != ctx.room_id:
+        raise HTTPException(403, "Access denied")
+    if visit.status == models.VisitStatusEnum.completed:
+        raise HTTPException(409, "Visit already completed")
+    if visit.status == models.VisitStatusEnum.cancelled:
+        raise HTTPException(409, "Visit was cancelled")
+
+    if body.transcript is not None:
+        incoming_transcript = body.transcript
+        current_transcript = visit.transcript or ""
+        if not current_transcript:
+            visit.transcript = incoming_transcript
+        elif incoming_transcript and len(incoming_transcript.strip()) >= len(current_transcript.strip()):
+            visit.transcript = incoming_transcript
+
+    if body.dialogue is not None:
+        incoming_dialogue = body.dialogue
+        current_dialogue = visit.dialogue or []
+        if not current_dialogue or len(incoming_dialogue) >= len(current_dialogue):
+            visit.dialogue = incoming_dialogue
+
+    if body.status is not None:
+        try:
+            new_status = models.VisitStatusEnum(body.status)
+        except ValueError as exc:
+            raise HTTPException(400, "Invalid visit status") from exc
+        if new_status != models.VisitStatusEnum.in_progress:
+            raise HTTPException(400, "Progress endpoint can only set status to in_progress")
+        if visit.status == models.VisitStatusEnum.pending:
+            visit.status = models.VisitStatusEnum.in_progress
+
+    db.commit()
+    return {"id": visit.id, "status": visit.status.value}
+
+
+@router.patch("/{visit_id}/prescription-draft")
+def update_prescription_draft(
+    visit_id: str,
+    body: UpdatePrescriptionDraftBody,
+    ctx: RequestContext = Depends(require_any_auth),
+    db: DBSession = Depends(get_db),
+):
+    """Update the prescription draft for a visit without approving it.
+    This allows doctors to edit prescriptions before final approval."""
+    visit = db.query(models.Visit).filter(models.Visit.id == visit_id, models.Visit.is_deleted == False).first()
+    if not visit:
+        raise HTTPException(404, "Visit not found")
+    if ctx.is_room_device and visit.room_id != ctx.room_id:
+        raise HTTPException(403, "Access denied")
+    
+    # Only allow updating prescription draft for pending or in_progress visits
+    if visit.status not in (models.VisitStatusEnum.pending, models.VisitStatusEnum.in_progress):
+        raise HTTPException(409, f"Cannot edit prescription for visit with status: {visit.status.value}")
+    
+    # Initialize summary if it doesn't exist
+    if not visit.summary:
+        visit.summary = {}
+    
+    # Update the prescription draft
+    visit.summary['prescriptionDraft'] = body.prescriptionDraft
+
+    if not visit.summary.get('quality'):
+        visit.summary['quality'] = {
+            'score': 55.0,
+            'confidence': 0.55,
+            'missingFields': [],
+            'mode': 'hybrid',
+            'generatedAt': datetime.utcnow().isoformat(),
+        }
+
+    if not visit.summary.get('chiefComplaint'):
+        snapshot = visit.summary.get('clinicalSnapshot') or []
+        if isinstance(snapshot, list):
+            for item in snapshot:
+                if not isinstance(item, dict):
+                    continue
+                label = str(item.get('label') or '').strip()
+                category = str(item.get('category') or '').strip().lower()
+                status = str(item.get('status') or 'confirmed').strip().lower()
+                if label and category == 'symptom' and status != 'denied':
+                    visit.summary['chiefComplaint'] = label
+                    break
+    flag_modified(visit, 'summary')
+
+    db.commit()
+    return {"id": visit.id, "prescriptionDraft": visit.summary.get('prescriptionDraft')}
+
+
+@router.patch("/{visit_id}/approve")
+def approve_visit(
+    visit_id: str,
+    body: VisitApprove,
+    ctx: RequestContext = Depends(require_any_auth),
+    db: DBSession = Depends(get_db),
+):
+    visit = db.query(models.Visit).filter(models.Visit.id == visit_id, models.Visit.is_deleted == False).first()
+    if not visit:
+        raise HTTPException(404, "Visit not found")
+    if ctx.is_room_device and visit.room_id != ctx.room_id:
+        raise HTTPException(403, "Access denied")
+    if visit.status == models.VisitStatusEnum.completed:
+        raise HTTPException(409, "Visit already completed")
+    if visit.status == models.VisitStatusEnum.cancelled:
+        raise HTTPException(409, "Visit was cancelled")
+
+    if body.doctor_id:
+        doctor = db.query(models.Doctor).filter(models.Doctor.id == body.doctor_id, models.Doctor.is_active == True).first()
+        if not doctor:
+            raise HTTPException(404, "Doctor not found")
+
+    now = datetime.utcnow()
+    try:
+        with db.begin_nested():
+            normalized_summary = _sanitize_summary_for_response(body.summary.model_dump())
+            validation = _validate_summary_for_approval(normalized_summary)
+            if not validation["ok"]:
+                raise HTTPException(
+                    422,
+                    {
+                        "message": "Summary validation failed",
+                        "missingFields": validation["missingFields"],
+                        "warnings": validation["warnings"],
+                    },
+                )
+
+            visit.summary = normalized_summary
+
+            normalized_quality = _normalize_quality_payload(visit.summary)
+            if normalized_quality is not None:
+                visit.summary["quality"] = normalized_quality
+
+            structured_findings = _normalize_structured_findings_payload(visit.summary)
+            if structured_findings:
+                visit.summary["structuredFindings"] = structured_findings
+
+            chief_complaint = str(visit.summary.get("chiefComplaint") or visit.summary.get("chief_complaint") or "").strip()
+            if not chief_complaint:
+                snapshot = visit.summary.get("clinicalSnapshot") or []
+                if isinstance(snapshot, list):
+                    for item in snapshot:
+                        if not isinstance(item, dict):
+                            continue
+                        label = str(item.get("label") or "").strip()
+                        category = str(item.get("category") or "").strip().lower()
+                        status = str(item.get("status") or "confirmed").strip().lower()
+                        if label and category == "symptom" and status != "denied":
+                            chief_complaint = label
+                            break
+            if chief_complaint:
+                visit.summary["chiefComplaint"] = chief_complaint[:500]
+
+            normalized_summary_model = VisitSummarySchema.model_validate(visit.summary)
+            med_history = _get_or_create_medical_history(db, visit.patient_id)
+            _merge_summary_into_medical_history(med_history, normalized_summary_model, body.doctor_id or ctx.sub)
+
+            visit.status = models.VisitStatusEnum.completed
+            visit.ended_at = now
+            visit.approved_at = now
+            visit.approved_by = body.doctor_id or ctx.sub
+            if hasattr(visit, "completed_at"):
+                setattr(visit, "completed_at", now)
+
+            visit.transcript = ""
+            visit.dialogue = []
+
+            if body.doctor_id:
+                visit.doctor_id = body.doctor_id
+
+            _complete_linked_appointment(db, visit, now)
+            _close_queue_entry(db, visit, now)
+            _release_room(db, visit)
+
+            flag_modified(visit, "summary")
+            db.flush()
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    audit(db, ctx, "APPROVE_VISIT", "visit", visit_id, {"patient_id": visit.patient_id, "status": visit.status.value})
+    return {"id": visit.id, "status": visit.status.value}
+
+
+@router.post("/{visit_id}/validate-summary")
+def validate_visit_summary(
+    visit_id: str,
+    body: ValidateSummaryBody,
+    ctx: RequestContext = Depends(require_any_auth),
+    db: DBSession = Depends(get_db),
+):
+    visit = db.query(models.Visit).filter(models.Visit.id == visit_id, models.Visit.is_deleted == False).first()
+    if not visit:
+        raise HTTPException(404, "Visit not found")
+    if ctx.is_room_device and visit.room_id != ctx.room_id:
+        raise HTTPException(403, "Access denied")
+
+    source_summary = body.summary if isinstance(body.summary, dict) else (visit.summary if isinstance(visit.summary, dict) else {})
+    normalized_summary = _sanitize_summary_for_response(source_summary)
+    validation = _validate_summary_for_approval(normalized_summary)
+
+    return {
+        "ok": validation["ok"],
+        "missingFields": validation["missingFields"],
+        "warnings": validation["warnings"],
+        "normalizedSummary": normalized_summary,
+    }
+
+
+@router.delete("/{visit_id}", status_code=204)
+def delete_visit(
+    visit_id: str,
+    ctx: RequestContext = Depends(require_admin),
+    db: DBSession = Depends(get_db),
+):
+    """Soft-delete a visit. Marks as deleted but keeps in audit trail.
+    Only admin can delete. Visit remains queryable by audit system."""
+    visit = db.query(models.Visit).filter(models.Visit.id == visit_id).first()
+    if not visit:
+        raise HTTPException(404, "Visit not found")
+    if visit.is_deleted:
+        raise HTTPException(409, "Visit already deleted")
+
+    visit.is_deleted = True
+    visit.deleted_at = datetime.utcnow()
+    db.commit()
+    audit(db, ctx, "DELETE_VISIT", "visit", visit_id, {"patient_id": visit.patient_id, "deleted_at": visit.deleted_at.isoformat()})
